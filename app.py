@@ -1,185 +1,120 @@
-"""
-LangChain Agent with Streamlit - Simple UI
-"""
-
-import streamlit as st
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import tool
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from agent import create_agent, chat
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_openai import ChatOpenAI
-from langchain_community.tools.tavily_search import TavilySearchResults
-from datetime import datetime
-import requests
-import os
-from dotenv import load_dotenv
+import threading
 
-# Load .env for local development (optional)
-load_dotenv()
+app = FastAPI(title="Agent API",
+             description="API for the LangChain Agent",
+             version="1.0.0")
 
-# =============================================================================
-# PAGE CONFIG
-# =============================================================================
-
-st.set_page_config(
-    page_title="AI Agent Chat",
-    page_icon="🤖",
-    layout="centered"
+# CORS middleware to allow frontend to connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# =============================================================================
-# TOOLS
-# =============================================================================
+# Initialize the agent
+agent_executor = create_agent()
 
-@tool
-def get_current_datetime() -> str:
-    """Get the current date and time."""
-    now = datetime.now()
-    return now.strftime("%Y-%m-%d %H:%M:%S")
+# Initialize chat history and lock
+chat_history: List[Tuple[str, str]] = []
+chat_lock = threading.Lock()
 
+# Ensure agent has memory attribute
+if not hasattr(agent_executor, 'memory'):
+    from langchain.memory import ConversationBufferMemory
+    agent_executor.memory = ConversationBufferMemory(return_messages=True)
 
-@tool
-def get_weather(city: str) -> str:
-    """Get current weather for a city."""
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+@app.get("/")
+async def root():
+    return {"message": "Agent API is running. Use /chat to interact with the agent."}
+
+# In-memory session storage (in production, use a proper database)
+session_storage = {}
+
+def get_or_create_session(session_id: str) -> List[Tuple[str, str]]:
+    if session_id not in session_storage:
+        session_storage[session_id] = []
+    return session_storage[session_id]
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(chat_request: ChatRequest):
     try:
-        url = f"https://wttr.in/{city}?format=j1"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            current = data["current_condition"][0]
-            weather_desc = current["weatherDesc"][0]["value"]
-            temp_c = current["temp_C"]
-            feels_like = current["FeelsLikeC"]
-            humidity = current["humidity"]
-            return (
-                f"Weather in {city}: {weather_desc}, "
-                f"Temperature: {temp_c}°C (feels like {feels_like}°C), "
-                f"Humidity: {humidity}%"
-            )
+        # Generate a session ID if not provided
+        if not chat_request.session_id:
+            import uuid
+            session_id = str(uuid.uuid4())
         else:
-            return f"Could not fetch weather for {city}"
-    except Exception as e:
-        return f"Error getting weather: {str(e)}"
-
-
-# =============================================================================
-# AGENT
-# =============================================================================
-
-@st.cache_resource
-def create_agent() -> AgentExecutor:
-    """Initialize the agent."""
-    # ChatOpenAI will read OPENAI_API_KEY from environment
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.7,
-    )
-
-    tavily_tool = TavilySearchResults(max_results=3, search_depth="basic")
-    tools = [get_current_datetime, get_weather, tavily_tool]
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a helpful AI assistant with access to datetime, weather, "
-                "and web search tools.",
-            ),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ]
-    )
-
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-    )
-
-
-# =============================================================================
-# SESSION STATE / API KEYS
-# =============================================================================
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "agent_executor" not in st.session_state:
-    # Prefer Streamlit secrets, fall back to environment (for local dev)
-    openai_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-    tavily_key = st.secrets.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY"))
-
-    if not openai_key or not tavily_key:
-        st.error(
-            "⚠ Missing API keys! "
-            "Add OPENAI_API_KEY and TAVILY_API_KEY in Streamlit secrets "
-            "or your .env file."
-        )
-        st.stop()
-
-    # Make sure libraries see the keys as env vars
-    os.environ["OPENAI_API_KEY"] = openai_key
-    os.environ["TAVILY_API_KEY"] = tavily_key
-
-    st.session_state.agent_executor = create_agent()
-
-
-# =============================================================================
-# UI
-# =============================================================================
-
-st.title("🤖 AI Agent Chat")
-
-# Clear chat button
-if st.button("Clear Chat"):
-    st.session_state.messages = []
-    st.rerun()
-
-# Display messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Chat input
-if prompt := st.chat_input("Type your message..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+            session_id = chat_request.session_id
+        
+        with chat_lock:
+            # Get or create session
+            session = get_or_create_session(session_id)
+            
             try:
-                formatted_history = []
-                for msg in st.session_state.messages[:-1]:
-                    if msg["role"] == "user":
-                        formatted_history.append(
-                            HumanMessage(content=msg["content"])
-                        )
-                    elif msg["role"] == "assistant":
-                        formatted_history.append(
-                            AIMessage(content=msg["content"])
-                        )
-
-                response = st.session_state.agent_executor.invoke(
-                    {
-                        "input": prompt,
-                        "chat_history": formatted_history,
-                    }
-                )
-
-                assistant_response = response["output"]
-                st.markdown(assistant_response)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": assistant_response}
-                )
-
+                # Ensure agent has memory
+                if not hasattr(agent_executor, 'memory'):
+                    from langchain.memory import ConversationBufferMemory
+                    agent_executor.memory = ConversationBufferMemory(return_messages=True)
+                
+                # Process the chat message
+                response = chat(chat_request.message, agent_executor)
+                
+                # Get the updated history safely
+                updated_history = []
+                if hasattr(agent_executor, 'memory') and agent_executor.memory:
+                    if hasattr(agent_executor.memory, 'chat_memory'):
+                        updated_history = agent_executor.memory.chat_memory.messages
+                
+                # If no updated history, use the current session
+                if not updated_history:
+                    updated_history = session
+                
+                # Update session storage with the latest messages
+                # Convert messages to a serializable format
+                serialized_history = []
+                for msg in updated_history:
+                    if hasattr(msg, 'content'):
+                        role = 'assistant' if hasattr(msg, 'type') and msg.type == 'ai' else 'user'
+                        serialized_history.append((role, msg.content))
+                
+                if serialized_history:
+                    session_storage[session_id] = serialized_history
+                
+                return {
+                    "response": response,
+                    "session_id": session_id
+                }
+                
             except Exception as e:
-                error_msg = f"❌ Error: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_msg}
-                )
+                # Log the full error for debugging
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"Error in chat processing: {error_details}")
+                
+                # Return a user-friendly error message
+                return {
+                    "response": "I'm sorry, I encountered an error processing your request. Please try again.",
+                    "session_id": session_id
+                }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
